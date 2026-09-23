@@ -95,6 +95,25 @@ class EventOut(BaseModel):
     reveal_count: int
 
 
+class EventSnapshotOut(BaseModel):
+    event_id: UUID
+    snapshot_at: datetime = Field(
+        description="快照时刻（请求参数 at 归一化为 UTC 后的同一时刻）"
+    )
+    title: str
+    description: Optional[str]
+    created_at: datetime
+    commit_deadline: datetime = Field(
+        description="该时刻生效的提交截止时间（已回放创建记录与此前全部截止时间延长）"
+    )
+    reveal_deadline: datetime = Field(
+        description="该时刻生效的揭示截止时间（已回放创建记录与此前全部截止时间延长）"
+    )
+    status: str = Field(description="该时刻事件所处阶段：commit | reveal | closed")
+    commitment_count: int = Field(description="快照时刻前（含该时刻）已写入的承诺数量")
+    reveal_count: int = Field(description="快照时刻前（含该时刻）已写入的揭示数量")
+
+
 class CommitmentOut(BaseModel):
     id: UUID
     event_id: UUID
