@@ -1,6 +1,6 @@
 """业务规则冒烟测试。
 
-通过 DATABASE_URL 指向临时 SQLite 文件，并猴子补丁 app.main.now_utc
+通过 DATABASE_URL 指向临时 SQLite 文件，并猴子补丁 app.clock.now_utc
 模拟服务端 UTC 时钟推进，确定性验证各阶段边界行为。
 """
 
@@ -14,6 +14,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/test.db"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+import app.clock as clock_module  # noqa: E402
 import app.main as main_module  # noqa: E402
 from app.hashing import compute_commitment  # noqa: E402
 
@@ -32,7 +33,7 @@ class FakeClock:
 
 
 clock = FakeClock(T0)
-main_module.now_utc = clock
+clock_module.now_utc = clock
 
 client = TestClient(main_module.app)
 

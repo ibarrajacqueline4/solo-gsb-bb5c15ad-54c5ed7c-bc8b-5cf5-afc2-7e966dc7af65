@@ -51,6 +51,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events` | 创建事件（commit_deadline 须在未来，reveal_deadline 须更晚） |
 | GET | `/events` | 事件列表（含状态与计数） |
 | GET | `/events/{id}` | 事件详情 |
+| GET | `/events/{id}/snapshot?at=...` | 按指定带时区历史时刻重建事件视图（回放延长与计数） |
 | POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/schedule` | 批量事件的阶段窗口资源排程（最少轨道确定性着色） |
@@ -153,6 +154,58 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 事件已进入 reveal / closed 阶段 |
 | 409 | `INVALID_EXTENSION` | 新 commit 未晚于当前值，或新 reveal 未晚于新 commit / 当前 reveal（只延不缩） |
 | 422 | — | 时间格式非法、时间无时区、`reason` 缺失或为空、事件 ID 非 UUID |
+
+## 历史时刻事件快照（`GET /events/{id}/snapshot?at=...`）
+
+按调用方指定的**带时区历史时刻**重建事件在当时的只读视图，与服务端当前时钟无关，
+也不会修改任何数据。典型用途：审计「某个截止时间延长生效之前」事件处于什么阶段、
+当时已有多少承诺与揭示。
+
+```bash
+curl -s 'http://localhost:8000/events/<EVENT_ID>/snapshot?at=2030-01-01T00:30:00Z'
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "title": "我的预测",
+  "description": null,
+  "created_at": "2030-01-01T00:00:00Z",
+  "snapshot_at": "2030-01-01T00:30:00Z",
+  "commit_deadline": "2030-01-01T06:00:00Z",
+  "reveal_deadline": "2030-01-02T06:00:00Z",
+  "status": "commit",
+  "commitment_count": 2,
+  "reveal_count": 0
+}
+```
+
+**回放规则**（所有比较按 UTC 时刻，边界均**含 `at` 本身**）：
+
+- 以事件创建记录为起点，按发生时间 `(created_at, id)` 升序回放
+  `deadline_extensions`：仅 `created_at <= at` 的延长在该时刻已生效，
+  **最近一条**已生效延长的新截止时间即当时生效的 `commit_deadline` /
+  `reveal_deadline`；若首次延长尚未发生，则使用创建时的原始截止时间
+  （即首条延长审计记录的旧值）；
+- `status` 用**回放后**的截止时间按常规半开语义判定：`at < commit_deadline`
+  为 `commit`，`at < reveal_deadline` 为 `reveal`，其后为 `closed`；
+- `commitment_count` / `reveal_count` 只统计 `created_at <= at` 的记录
+  （该时刻之后才写入的承诺/揭示不计入）；
+- 响应回显 `created_at` 与归一化到 UTC 的 `snapshot_at`。
+
+`at` 接受任意携带时区偏移的 ISO 8601 时间（`Z` 后缀与 `+08:00` 这类偏移均可，
+按同一 UTC 时刻处理）。允许取**未来**时刻：返回截至查询时已知的最新截止时间、
+全部已写入计数与按该时刻判定的状态。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 快照重建成功 |
+| 400 | `MISSING_SNAPSHOT_TIME` | 缺少查询参数 `at` |
+| 400 | `INVALID_SNAPSHOT_TIME` | `at` 为空或无法解析为 ISO 8601 时间 |
+| 400 | `NAIVE_SNAPSHOT_TIME` | `at` 未携带时区偏移（如 `2030-01-01T00:30:00`） |
+| 400 | `SNAPSHOT_BEFORE_CREATION` | `at` 早于事件创建时间（事件在该时刻尚不存在） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 422 | — | 事件 ID 非 UUID |
 
 ## 事件窗口冲突分析（`POST /events/conflicts`）
 
@@ -406,6 +459,8 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
 | 400 | `INVALID_TRACK_LIMIT` | 资源排程的 track_limit 缺失、非整数（含布尔值）或小于 1 |
+| 400 | `MISSING_SNAPSHOT_TIME` / `INVALID_SNAPSHOT_TIME` / `NAIVE_SNAPSHOT_TIME` | 历史快照缺少 `at`、时间无法解析或未携带时区 |
+| 400 | `SNAPSHOT_BEFORE_CREATION` | 快照时刻早于事件创建时间 |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程请求中的任一 ID） |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
@@ -473,6 +528,7 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 ```
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
+  clock.py      # 统一时钟（阶段判定与记录 created_at 的唯一时间来源，可整体替换）
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
   scheduling.py # 阶段窗口资源排程：最少轨道的确定性区间着色（纯函数，可独立单测）
   models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
@@ -480,6 +536,7 @@ app/
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
 tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线

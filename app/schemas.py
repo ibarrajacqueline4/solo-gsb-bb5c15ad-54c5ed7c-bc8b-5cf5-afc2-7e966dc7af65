@@ -95,6 +95,21 @@ class EventOut(BaseModel):
     reveal_count: int
 
 
+class EventSnapshotOut(BaseModel):
+    """事件在指定历史时刻的只读重建视图（不反映该时刻之后的任何写入）。"""
+
+    event_id: UUID
+    title: str
+    description: Optional[str]
+    created_at: datetime = Field(description="事件创建时间（UTC，回放的起点）")
+    snapshot_at: datetime = Field(description="快照时刻（按 UTC 归一化回显，即请求中的 at）")
+    commit_deadline: datetime = Field(description="快照时刻生效的提交截止时间（已回放到当时的延长）")
+    reveal_deadline: datetime = Field(description="快照时刻生效的揭示截止时间（已回放到当时的延长）")
+    status: str = Field(description="按快照时刻与回放截止时间判定：commit | reveal | closed")
+    commitment_count: int = Field(description="快照时刻之前（含）已写入的承诺数量")
+    reveal_count: int = Field(description="快照时刻之前（含）已写入的揭示数量")
+
+
 class CommitmentOut(BaseModel):
     id: UUID
     event_id: UUID

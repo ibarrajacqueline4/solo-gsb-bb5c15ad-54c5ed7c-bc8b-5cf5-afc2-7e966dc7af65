@@ -1,7 +1,7 @@
 """POST /events/schedule 的资源排程测试。
 
 几何用例通过直接写库、显式指定 created_at / 两个截止时间，避免依赖墙钟；
-app.main.now_utc 同样替换为固定时钟。另对纯函数 app.scheduling.color_phase /
+app.clock.now_utc 同样替换为固定时钟。另对纯函数 app.scheduling.color_phase /
 overload_pairs / schedule 做单元级边界验证。
 """
 
@@ -17,6 +17,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/schedule.db"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+import app.clock as clock_module  # noqa: E402
 import app.main as main_module  # noqa: E402
 from app.conflicts import COMMIT, REVEAL, PhaseWindow  # noqa: E402
 from app.database import SessionLocal  # noqa: E402
@@ -42,7 +43,7 @@ client = TestClient(main_module.app)
 @pytest.fixture(autouse=True)
 def _fixed_clock(monkeypatch):
     # 每个用例独立打补丁，避免模块导入顺序覆盖其他测试模块的模拟时钟
-    monkeypatch.setattr(main_module, "now_utc", _client_clock)
+    monkeypatch.setattr(clock_module, "now_utc", _client_clock)
     with client:  # 触发 lifespan 建表（幂等）
         yield
 

@@ -20,6 +20,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/extend.db"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import app.clock as clock_module  # noqa: E402
 import app.main as main_module  # noqa: E402
 from app.database import SessionLocal  # noqa: E402
 from app.models import DeadlineExtension  # noqa: E402
@@ -46,7 +47,7 @@ client = TestClient(main_module.app)
 @pytest.fixture(autouse=True)
 def _fixed_clock(monkeypatch):
     clock.t = T0
-    monkeypatch.setattr(main_module, "now_utc", clock)
+    monkeypatch.setattr(clock_module, "now_utc", clock)
     with client:  # 触发 lifespan 建表（幂等）
         yield
 

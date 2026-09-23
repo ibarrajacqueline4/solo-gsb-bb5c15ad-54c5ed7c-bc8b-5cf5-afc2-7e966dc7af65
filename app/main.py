@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
+from . import clock
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal
@@ -34,6 +35,7 @@ from .schemas import (
     DeadlineExtensionOut,
     EventCreate,
     EventOut,
+    EventSnapshotOut,
     HashOut,
     RevealBatchCreate,
     RevealBatchOut,
@@ -57,8 +59,12 @@ logger = logging.getLogger("sealed-predictions")
 
 
 def now_utc() -> datetime:
-    """服务端当前 UTC 时间，全部截止判定以此为唯一依据。"""
-    return datetime.now(timezone.utc)
+    """服务端当前 UTC 时间。
+
+    委托给统一时钟模块 ``app.clock``：阶段判定与记录 created_at 默认值
+    共用同一时间来源，测试中替换 ``app.clock.now_utc`` 即可同时控制两者。
+    """
+    return clock.now_utc()
 
 
 def as_utc(dt: datetime) -> datetime:
@@ -68,12 +74,54 @@ def as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def event_status(event: Event, now: datetime) -> str:
-    if now < as_utc(event.commit_deadline):
+def phase_for_deadlines(
+    at: datetime, commit_deadline: datetime, reveal_deadline: datetime
+) -> str:
+    """按半开区间判定阶段：[创建, commit_dl) commit；[commit_dl, reveal_dl) reveal；其后 closed。"""
+    if at < commit_deadline:
         return "commit"
-    if now < as_utc(event.reveal_deadline):
+    if at < reveal_deadline:
         return "reveal"
     return "closed"
+
+
+def event_status(event: Event, now: datetime) -> str:
+    return phase_for_deadlines(
+        now, as_utc(event.commit_deadline), as_utc(event.reveal_deadline)
+    )
+
+
+def parse_snapshot_at(raw: str | None) -> datetime:
+    """解析快照查询参数 at：必须是携带时区偏移的 ISO 8601 时间。
+
+    与请求体不同，查询参数由路由自行解析，使「缺失 / 无法解析 / 无时区」
+    都返回统一的业务错误 400，而不是 FastAPI 的 422。
+    """
+    if not raw:
+        raise api_error(
+            400,
+            "MISSING_SNAPSHOT_TIME",
+            "缺少必填查询参数 at（携带时区偏移的 ISO 8601 时间，如 2030-01-01T00:00:00Z）",
+        )
+    text = raw.strip()
+    # datetime.fromisoformat 在 3.11 之前不接受结尾的 Z，统一改写为显式 UTC 偏移
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise api_error(
+            400,
+            "INVALID_SNAPSHOT_TIME",
+            f"at={raw!r} 不是合法的 ISO 8601 时间（如 2030-01-01T00:00:00Z）",
+        )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise api_error(
+            400,
+            "NAIVE_SNAPSHOT_TIME",
+            f"at={raw!r} 缺少时区偏移，必须携带时区（如 2030-01-01T00:00:00Z 或 +08:00）",
+        )
+    return as_utc(parsed)
 
 
 def api_error(
@@ -223,6 +271,87 @@ def list_events(db: Session = Depends(get_db)):
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: UUID, db: Session = Depends(get_db)):
     return event_out(get_event_or_404(db, event_id), db, now_utc())
+
+
+@app.get("/events/{event_id}/snapshot", response_model=EventSnapshotOut)
+def get_event_snapshot(event_id: UUID, at: str | None = None, db: Session = Depends(get_db)):
+    """按指定历史时刻重建事件视图（纯只读，不依赖服务端当前时钟）。
+
+    回放规则（所有时间按 UTC 时刻比较，边界含 at 本身）：
+      - 起点为事件创建记录；按发生时间 (created_at, id) 升序回放
+        deadline_extensions，应用其中 created_at <= at 的延长——
+        最近一条已生效延长的新截止时间即当时生效的截止时间；at 早于
+        首次延长时，取首次延长记录中的旧值（即创建时的原始截止时间）；
+      - status 用回放后的截止时间按常规半开语义判定：
+        at < commit_deadline 为 commit，at < reveal_deadline 为 reveal，
+        其后为 closed；
+      - commitment_count / reveal_count 只统计 created_at <= at 的记录
+        （at 之后才写入的承诺/揭示不计入）。
+
+    错误：
+      - at 缺失、无法解析为 ISO 8601 或未携带时区 -> 400
+        （MISSING_SNAPSHOT_TIME / INVALID_SNAPSHOT_TIME / NAIVE_SNAPSHOT_TIME）；
+      - at 早于事件创建时间 -> 400 SNAPSHOT_BEFORE_CREATION；
+      - 事件不存在 -> 404 EVENT_NOT_FOUND。
+    """
+    snapshot_at = parse_snapshot_at(at)
+    event = get_event_or_404(db, event_id)
+    created_at = as_utc(event.created_at)
+    if snapshot_at < created_at:
+        raise api_error(
+            400,
+            "SNAPSHOT_BEFORE_CREATION",
+            f"快照时刻 {snapshot_at.isoformat()} 早于事件创建时间 {created_at.isoformat()}，"
+            "事件在该时刻尚不存在",
+        )
+
+    # 按发生时间排序的延长审计：只应用 at（含）之前已写入的延长
+    extensions = (
+        db.query(DeadlineExtension)
+        .filter(DeadlineExtension.event_id == event.id)
+        .order_by(DeadlineExtension.created_at, DeadlineExtension.id)
+        .all()
+    )
+    applied = [e for e in extensions if as_utc(e.created_at) <= snapshot_at]
+    if applied:
+        commit_dl = as_utc(applied[-1].new_commit_deadline)
+        reveal_dl = as_utc(applied[-1].new_reveal_deadline)
+    else:
+        # 尚未发生任何延长：首次延长记录的旧值即创建时的原始截止时间；
+        # 无延长记录时回退到事件当前字段（快照场景下二者相同）
+        first = extensions[0] if extensions else None
+        commit_dl = as_utc(first.old_commit_deadline if first else event.commit_deadline)
+        reveal_dl = as_utc(first.old_reveal_deadline if first else event.reveal_deadline)
+
+    # 计数只含 at（含）之前已写入的记录；在 Python 侧按 UTC 时刻比较，
+    # 避免不同数据库方言对带时区时间字符串比较的差异
+    commitment_count = sum(
+        1
+        for c in db.query(Commitment.created_at)
+        .filter(Commitment.event_id == event.id)
+        .all()
+        if as_utc(c[0]) <= snapshot_at
+    )
+    reveal_count = sum(
+        1
+        for r in db.query(Reveal.created_at)
+        .filter(Reveal.event_id == event.id)
+        .all()
+        if as_utc(r[0]) <= snapshot_at
+    )
+
+    return EventSnapshotOut(
+        event_id=event.id,
+        title=event.title,
+        description=event.description,
+        created_at=created_at,
+        snapshot_at=snapshot_at,
+        commit_deadline=commit_dl,
+        reveal_deadline=reveal_dl,
+        status=phase_for_deadlines(snapshot_at, commit_dl, reveal_dl),
+        commitment_count=commitment_count,
+        reveal_count=reveal_count,
+    )
 
 
 @app.post("/events/{event_id}/extend", response_model=DeadlineExtensionOut)
